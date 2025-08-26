@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Alps Joyplot — by Yufei Xia</title>
+  <link rel="stylesheet" href="https://js.arcgis.com/4.26/esri/themes/light/main.css" />
+  <script src="https://js.arcgis.com/4.26/"></script>
+  <style>
+    html, body, #viewDiv { height: 100%; width: 100%; margin: 0; padding: 0; }
+    .panel {
+      position: absolute; top: 16px; right: 16px; z-index: 10; /* 改到右上，避免挡住缩放条 */
+      background: rgba(255,255,255,0.92); backdrop-filter: blur(6px);
+      border-radius: 14px; box-shadow: 0 6px 24px rgba(0,0,0,0.15);
+      padding: 12px 14px; min-width: 260px; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    }
+    .panel h3 { margin: 4px 0 8px; font-size: 14px; letter-spacing: .3px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+    label { font-size: 12px; color: #333; display: block; margin-bottom: 4px; }
+    select, input[type="number"], input[type="range"], button {
+      width: 100%; box-sizing: border-box; border-radius: 10px; border: 1px solid #e5e7eb;
+      padding: 8px 10px; font-size: 12px; background: #fff;
+    }
+    .btn { cursor: pointer; border: none; background: #111827; color:#fff; }
+    .btn.secondary { background:#374151; }
+    .range-wrap { display:flex; align-items:center; gap:8px; }
+    .range-wrap input[type="range"] { flex:1; }
+    .footer {
+      position: absolute; left: 16px; bottom: 16px; z-index: 10;
+      background: rgba(0,0,0,0.6); color:#fff; padding: 8px 12px; border-radius: 12px; font-size: 12px;
+    }
+    .footer a { color: #c7d2fe; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div id="viewDiv"></div>
+
+  <!-- 控制面板（默认瑞士 + 50 + ×3） -->
+  <div class="panel">
+    <h3>Alps 3D Joyplot — Controls</h3>
+
+    <div class="row">
+      <div>
+        <label>Country preset</label>
+        <select id="preset">
+          <option value="CH,AT,IT,FR,DE,SI">Alps (CH AT IT FR DE SI)</option>
+          <option value="IT">Italy</option>
+          <option value="AT">Austria</option>
+          <option value="FR">France</option>
+          <option value="CH">Switzerland</option>
+          <option value="CH,IT">CH + IT</option>
+          <option value="AT,SI">AT + SI</option>
+        </select>
+      </div>
+      <div>
+        <label>Min peak height (m)</label>
+        <input id="minHeight" type="number" min="0" step="100" value="4300"/>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>Stripes</label>
+        <div class="range-wrap">
+          <input id="stripes" type="range" min="20" max="140" step="5" value="50"/>
+          <span id="stripesVal">50</span>
+        </div>
+      </div>
+      <div>
+        <label>Exaggeration (×)</label>
+        <div class="range-wrap">
+          <input id="exag" type="range" min="1" max="8" step="0.5" value="3"/>
+          <span id="exagVal">3.0</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="row">
+      <button id="regen" class="btn">Re-generate</button>
+      <button id="export" class="btn secondary">Export PNG</button>
+    </div>
+  </div>
+
+  <!-- 署名 / 水印 -->
+  <div class="footer">
+    © 2025 <strong>Yufei Xia</strong> — <a href="#" target="_blank">portfolio</a>
+  </div>
+
+  <script>
+    require([
+      "esri/Map",
+      "esri/views/SceneView",
+      "esri/Color",
+      "esri/Graphic",
+      "esri/layers/GraphicsLayer",
+      "esri/layers/FeatureLayer",
+      "esri/geometry/Polyline",
+      "esri/geometry/Mesh",
+      "esri/layers/ElevationLayer",
+      "esri/geometry/geometryEngine",
+      "esri/geometry/support/MeshMaterialMetallicRoughness",
+      "esri/geometry/support/webMercatorUtils",
+      "esri/widgets/NavigationToggle",
+      "esri/widgets/Zoom",
+      "esri/widgets/Compass",
+      "esri/widgets/Home",
+      "esri/widgets/Fullscreen"
+    ], function (
+      Map, SceneView, Color, Graphic, GraphicsLayer, FeatureLayer,
+      Polyline, Mesh, ElevationLayer, geometryEngine, MeshMaterialMetallicRoughness, webMercatorUtils,
+      NavigationToggle, Zoom, Compass, Home, Fullscreen
+    ) {
+
+      // ----------- UI refs -----------
+      const $preset = document.getElementById("preset");
+      const $minHeight = document.getElementById("minHeight");
+      const $stripes = document.getElementById("stripes");
+      const $stripesVal = document.getElementById("stripesVal");
+      const $exag = document.getElementById("exag");
+      const $exagVal = document.getElementById("exagVal");
+      const $regen = document.getElementById("regen");
+      const $export = document.getElementById("export");
+      // 默认：瑞士 + 数值文本
+      $preset.value = "CH";
+      $stripesVal.textContent = "60";
+      $exagVal.textContent = "4.0";
+      $stripes.addEventListener("input", () => $stripesVal.textContent = $stripes.value);
+      $exag.addEventListener("input", () => $exagVal.textContent = (+$exag.value).toFixed(1));
+
+      // ----------- Layers -----------
+      const elevationLayer = new ElevationLayer({
+        url: "https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/TopoBathy3D/ImageServer",
+      });
+
+      const meshLayer = new GraphicsLayer({ spatialReference: { wkid: 3857 } });
+
+      const countryBoundaries = new FeatureLayer({
+        url: "https://services.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/World_Countries_(Generalized)/FeatureServer",
+        outFields: ["*"],
+        renderer: {
+          type: "simple",
+          symbol: {
+            type: "polygon-3d",
+            symbolLayers: [{
+              type: "fill",
+              material: { color: [255, 250, 239, 0] },
+              outline: { color: [255,255,255,0.65], size: 2 }
+            }]
+          }
+        }
+      });
+
+      const peaks = new FeatureLayer({
+        url: "https://services.arcgis.com/V6ZHFr6zdgNZuVG0/arcgis/rest/services/AlpineSummits/FeatureServer",
+        returnZ: false,
+        screenSizePerspectiveEnabled: false,
+        outFields: ["*"],
+        renderer: {
+          type: "simple",
+          symbol: {
+            type: "point-3d",
+            symbolLayers: [{ type: "icon", resource: { primitive: "circle" }, material: { color: [255,255,255] }, size: 5 }],
+            verticalOffset: { screenLength: 150, maxWorldLength: 30000, minWorldLength: 10000 },
+            callout: { type: "line", size: 0.75, color: [255, 255, 255] },
+          }
+        },
+        labelingInfo: [{
+          labelPlacement: "center-right",
+          labelExpressionInfo: { expression: "var labels = [$feature.NAME, $feature.HOEHE + 'm']; return Concatenate(labels, TextFormatting.NewLine);" },
+          symbol: { type: "label-3d", symbolLayers: [{ type: "text", material: { color: "white" }, size: 10 }] }
+        }]
+      });
+
+      // ----------- Map & View -----------
+      const map = new Map({
+        layers: [meshLayer, countryBoundaries, peaks],
+        ground: { surfaceColor: "#cdcade" },
+      });
+
+      const view = new SceneView({
+        container: "viewDiv",
+        map,
+        viewingMode: "local",
+        qualityProfile: "high",
+        environment: {
+          background: { type: "color", color: "#cdcade" },
+          starsEnabled: false,
+          atmosphereEnabled: false,
+          lighting: { date: "Fri May 15 2020 13:06:37 GMT+0200 (Central European Summer Time)" }
+        }
+      });
+
+      window.view = view;
+
+      // ----------- Helpers -----------
+      const ISO_MAP = { CH: "Switzerland", AT: "Austria", IT: "Italy", FR: "France", DE: "Germany", SI: "Slovenia" };
+
+      function countriesWhereClause(presetStr) {
+        const list = presetStr.split(",").map(s => ISO_MAP[s.trim()]).filter(Boolean);
+        if (!list.length) return "1=0";
+        const quoted = list.map(n => `'${n}'`).join(", ");
+        return `COUNTRY IN (${quoted})`;
+      }
+
+      function getColorFromHeight(value) {
+        // color styles
+        const stops = [
+          { value: 0,     color: new Color([255,255,255]) },
+          { value: 4000,  color: new Color([210,210,230]) },
+          { value: 8000,  color: new Color([120,120,180]) },
+          { value: 14000, color: new Color([10,10,20]) }
+        ];
+        for (let i = 0; i < stops.length; i++) {
+          const s = stops[i];
+          if (value < s.value) {
+            if (i === 0) return s.color;
+            const p = stops[i - 1];
+            const t = (value - p.value) / (s.value - p.value);
+            return Color.blendColors(p.color, s.color, t);
+          }
+        }
+        return stops[stops.length - 1].color;
+      }
+
+      async function buildJoyplot() {
+        // 读取 UI
+        const whereCountries = countriesWhereClause($preset.value);
+        const minH = parseInt($minHeight.value || "0", 10);
+        const stripes = parseInt($stripes.value, 10);
+        const exaggeration = parseFloat($exag.value);
+
+        // 应用筛选
+        countryBoundaries.definitionExpression = whereCountries;
+        peaks.definitionExpression = `HOEHE >= ${minH}`;
+
+        await countryBoundaries.when();
+        await peaks.when();
+
+        // 计算 extent（投影为 3857）
+        const extent4326 = (await countryBoundaries.queryExtent()).extent;
+        const extent3857 = webMercatorUtils.project(extent4326, { wkid: 3857 });
+        const expanded = extent3857.expand(1.15);
+        const { xmin, xmax, ymin, ymax } = expanded;
+
+        view.clippingArea = { xmin, xmax, ymin, ymax, spatialReference: { wkid: 3857 } };
+        await view.goTo({ target: expanded, tilt: 70, heading: 2 }, { duration: 0 });
+
+        // 清旧 mesh
+        meshLayer.removeAll();
+
+        // 生成条纹
+        const stepY = (ymax - ymin) / stripes;
+        const cap = 14000;
+
+        for (let y = ymin; y < ymax; y += stepY) {
+          const line = new Polyline({
+            spatialReference: { wkid: 3857 }, hasZ: true,
+            paths: [[xmin, y, 0], [xmax, y, 0]]
+          });
+
+          const densified = geometryEngine.densify(line, 1000, "meters");
+          const res = await elevationLayer.queryElevation(densified, { demResolution: 1000 });
+          const path = res.geometry.paths[0];
+
+          for (let i = 0; i < path.length; i++) {
+            const z = path[i][2] * exaggeration;
+            path[i][2] = z > cap ? cap : z;
+          }
+
+          const vertices = path.map(p => p.slice());
+          const colors = path.map(p => {
+            const c = getColorFromHeight(p[2]);
+            return [c.r, c.g, c.b, 240];
+          });
+          const faces = [];
+          const len = path.length;
+
+          for (let i = 0; i < len; i++) {
+            const v1 = i;
+            const v2 = Math.min(i + 1, len - 1);
+            const v3 = len + i;
+            const v4 = len + Math.min(i + 1, len - 1);
+
+            const bottom = path[i].slice();
+            bottom[2] = 500; // 抬底，避免贴地
+            vertices.push(bottom);
+            colors.push([255, 255, 255, 240]);
+
+            if (i !== len - 1) faces.push(v2, v3, v1, v4, v3, v2);
+          }
+
+          const mesh = new Mesh({
+            vertexAttributes: { position: vertices.flat(), color: colors.flat() },
+            components: [{
+              faces,
+              material: new MeshMaterialMetallicRoughness({
+                color: "#ffffff",
+                metallic: 0.7,
+                emissiveColor: "#190670"
+              })
+            }],
+            spatialReference: { wkid: 3857 },
+          });
+
+          meshLayer.add(new Graphic({
+            geometry: mesh,
+            symbol: { type: "mesh-3d", symbolLayers: [{ type: "fill" }] },
+          }));
+        }
+
+        // 可手动切换为旋转模式（也可点击右下 NavigationToggle 切换）
+        const nav = view.ui.find("navigation-toggle");
+        if (nav) nav.viewModel.navigationMode = "rotate";
+      }
+
+      // 初始渲染（默认瑞士 + 50 条 + ×3）
+      view.when(buildJoyplot);
+
+      // 事件
+      $regen.addEventListener("click", buildJoyplot);
+
+      // 导出 PNG
+      $export.addEventListener("click", async () => {
+        const shot = await view.takeScreenshot({ width: 2000 });
+        const a = document.createElement("a");
+        a.href = shot.dataUrl;
+        a.download = "alps_joyplot.png";
+        a.click();
+      });
+    });
+  </script>
+</body>
+</html>
